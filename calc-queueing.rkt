@@ -62,4 +62,4 @@
     (printf "Response time calculation\n\nInput:\nService time:\t\t\t~a\nArrival rate (system):\t\t~a\nServers per queue:\t\t~a\nNo. of queues:\t\t\t~a\n\nOutput:\nUtilization:\t\t\t~a\nResponse time (eC/simple):\t~a / ~a\nQueue time (eC/simple):\t\t~a / ~a\nNo. in system (eC/simple):\t~a / ~a\nWait line length (eC/simple):\t~a / ~a\nNo. being served:\t\t~a\n\n" service-time arrival-rate-system servers-per-queue numqueues utilization rtime-ec rtime-simple qtime-ec qtime-simple nsys-ec nsys-simple wline-ec wline-simple num-served)))
     
 
-(compare-calcs 0.25 36 8 1)
+;(compare-calcs 0.25 36 8 1)

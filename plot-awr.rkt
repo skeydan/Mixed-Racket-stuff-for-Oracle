@@ -1,5 +1,6 @@
 #lang racket
 
+(require "../perftools/filters.rkt")
 (require "../plt-stuff/plot/plot2d.rkt")
 (require "../oci4racket/main.rkt")
 
@@ -20,7 +21,7 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
                  "\nand to_char(end_interval_time, 'D') = '1' -- get snap samples for whole weeks always, ending on Sunday
                   and to_char(end_interval_time, 'hh24') = '23' -- last compared-to (= subtracted) snasphot is from 23:00h, so last shown value is for 00:00h"))
   
-(define base-query
+(define base-stat-query
   "with input as 
      (select lag (t.snap_id) over (order by t.snap_id) prev_snap,
              lag (t.value) over (order by t.snap_id) prev_value,
@@ -43,7 +44,19 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
         and diff >= 0 -- because of possible instance bounces
         and time_diff = 1/24)")
 
-(define agg-by-hour-query
+(define base-metric-query
+  "with cleaned_input as 
+     (select t.snap_id snap,
+             t.average avg_,
+             t.standard_deviation stddev_,
+             s.end_interval_time snap_end
+      from &&tablename t join dba_hist_snapshot s 
+      on t.snap_id=s.snap_id
+      where t.snap_id between :first_snap and :last_snap+1
+      and t.metric_name = '&&statname'
+      order by t.snap_id)")
+
+(define (agg-by-hour-query base-query)
   (string-append base-query 
                  "\nselect trim(to_char(snap_end, 'DY')) day,
                            extract(hour from snap_end) time,
@@ -52,11 +65,30 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
 	            group by to_char(snap_end, 'DY'), to_char(snap_end, 'D'), extract(hour from snap_end)
 	            order by decode(to_char(snap_end, 'D'), 0, 7, to_char(snap_end, 'D')), 2"))
 
-(define detail-query
+
+(define (metric-agg-by-hour-query base-query)
+  (string-append base-query 
+                 "\nselect trim(to_char(snap_end, 'DY')) day,
+                           extract(hour from snap_end) time,
+                           round(avg(avg_),0) val
+	            from cleaned_input
+	            group by to_char(snap_end, 'DY'), to_char(snap_end, 'D'), extract(hour from snap_end)
+	            order by decode(to_char(snap_end, 'D'), 0, 7, to_char(snap_end, 'D')), 2"))
+
+(define (detail-query base-query)
   (string-append base-query
                  "\nselect trim(to_char(snap_end, 'DY')) day,
                            extract(hour from snap_end) time,
                            diff val
+	            from cleaned_input
+	            order by snap"))
+
+(define (metric-detail-query base-query)
+  (string-append base-query
+                 "\nselect trim(to_char(snap_end, 'DY')) day,
+                           extract(hour from snap_end) time,
+                           avg_ val,
+                           stddev_ stddev_
 	            from cleaned_input
 	            order by snap"))
 
@@ -65,7 +97,7 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
 
 (define (get-value-opts tableno table stmt)
   (let ((cols-query (cond ((< tableno 10) (string-append "select distinct stat_name from " table " order by stat_name"))
-                          ((< tableno 20) (string-append "select metric_name from " table " order by metric_name")))))
+                          ((< tableno 20) (string-append "select distinct metric_name from " table " order by metric_name")))))
     (let* ((res (begin (executestmt stmt cols-query) (getresultset stmt)))
            (namelst
             (let loop ((res res) (lst '()))
@@ -93,7 +125,7 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
                           (foldl (lambda (cat str) (string-append str (format-category cat))) "" stat-tables)))
 
 (define (accept prompt)
-  (begin (display prompt) (read-line))) ; port->string needs ctrl-D on command line, read-line returns eof on commandline, read cannot process spaces...
+  (begin (display prompt) (read-line))) 
 
 (define (construct-query query table col)
   (regexp-replace "&&tablename" (regexp-replace "&&statname" query col) table))
@@ -101,14 +133,39 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
 (define (build-result resultset)
   (let loop ((days '()) (hours '()) (vals '()))
     (if (eq? #f (fetchnext resultset))
-        (foldr (lambda (x y result) (cons (cons x y) result)) '()
+        (foldr (lambda (x y result) (cons (vector x y) result)) '()
                (foldl (lambda (day hour result)
                         (cons (string-append (case hour ((0) (string-append day " ")) (else ""))
                                              (case hour ((0 6 12 18) (format "~a:00" hour)) (else "")))
                               result))
                       '() days hours) (reverse vals))
-        (loop (cons (getstring2 resultset "day") days) (cons (getint2 resultset "time") hours) (cons (getint2 resultset "val") vals)))))
+        (loop (cons (getstring2 resultset "day") days) (cons (getint2 resultset "time") hours) (cons (getdouble2 resultset "val") vals)))))
 
+(define (build-plot-data resultset)
+  (let* ((data (get-data resultset))
+         (formatted-axis (format-x-axis (car data) (cadr data)))
+         (raw-values (caddr data))
+         (smoothed-byfives (byfives (raw-values))))
+    (list (vectorize-for-plotting formatted-axis raw-values)
+          (vectorize-for-plotting formatted-axis smoothed-byfives))))
+
+(define (get-data resultset)
+  (let loop ((days '()) (hours '()) (vals '()))
+    (if (eq? #f (fetchnext resultset))
+        (list days hours vals)
+        (loop (cons (getstring2 resultset "day") days) (cons (getint2 resultset "time") hours) (cons (getdouble2 resultset "val") vals)))))
+
+(define (vectorize-for-plotting x-axis vals)
+  (foldr (lambda (x y result) (cons (vector x y) result)) '() x-axis vals))
+
+(define (format-x-axis days hours)
+  (foldl (lambda (day hour result)
+           (cons (string-append (case hour ((0) (string-append day " ")) (else ""))
+                                (case hour ((0 6 12 18) (format "~a:00" hour)) (else "")))
+                 result))
+         '() days hours))
+                               
+  
 (define (main)
   (let* ((conn (begin (init) (connect "orcl" "hr" "hr" 'oci_session_default)))
          (stmt (createstmt conn))
@@ -116,26 +173,36 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
          (table (cadr (assoc (string->number tableno) (foldr append '() (map cdr stat-tables))))))
     (let-values (((namevec prompt) (get-value-opts (string->number tableno) table stmt)))
       (let* ((col (vector-ref namevec (string->number (accept prompt))))
-             (firstsnap-result (begin (executestmt&log stmt firstsnap-query) (getresultset stmt)))
-             (first-snap (and (fetchnext firstsnap-result) (getint2&log firstsnap-result "first_snap")))
-             (first-snap-time (timestamptotext (gettimestamp2&log firstsnap-result "first_end") "yyyy-mm-dd hh24:mi:ss" 30 0))
-             (lastsnap-result (begin (executestmt&log stmt lastsnap-base-query) (getresultset stmt)))
-             (last-snap (and (fetchnext lastsnap-result) (getint2&log lastsnap-result "last_snap")))
-             (lastsnap-endofweek-result (begin (executestmt&log stmt lastsnap-endofweek-query) (getresultset stmt)))
-             (last-endofweek-snap (and (fetchnext lastsnap-endofweek-result) (getint2&log lastsnap-endofweek-result "last_snap")))
+             (base-query (case (string->number tableno) ((1 2 3) base-stat-query) ((10) base-metric-query)))
+             (firstsnap-result (begin (executestmt stmt firstsnap-query) (getresultset stmt)))
+             (first-snap (and (fetchnext firstsnap-result) (getint2 firstsnap-result "first_snap")))
+             (first-snap-time (timestamptotext (gettimestamp2 firstsnap-result "first_end") "yyyy-mm-dd hh24:mi:ss" 30 0))
+             (lastsnap-result (begin (executestmt stmt lastsnap-base-query) (getresultset stmt)))
+             (last-snap (and (fetchnext lastsnap-result) (getint2 lastsnap-result "last_snap")))
+             (lastsnap-endofweek-result (begin (executestmt stmt lastsnap-endofweek-query) (getresultset stmt)))
+             (last-endofweek-snap (and (fetchnext lastsnap-endofweek-result) (getint2 lastsnap-endofweek-result "last_snap")))
              (agg-mode (accept (string-append (format "\n\nFirst available snapshot is from ~a.\nHow do you want the data displayed?\n\n" first-snap-time) (foldl (lambda (mode str) (string-append str (format "~a: ~a~n" (car mode) (cadr mode)))) "" agg-modes)))))
         (let ((data
-               (case (string->number agg-mode)
-                 ((1) (build-result (and (prepare&log stmt (construct-query agg-by-hour-query table col)) (bindint&log stmt ":first_snap" first-snap) (bindint&log stmt ":last_snap" last-endofweek-snap) (execute stmt) (getresultset stmt))))
-                 ((2) (build-result (and (prepare&log stmt (construct-query detail-query table col)) (bindint&log stmt ":first_snap" (- last-snap (* 24 7))) (bindint&log stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))
-                 ((3) (build-result (and (prepare&log stmt (construct-query detail-query table col)) (bindint&log stmt ":first_snap" (- last-snap (* 24 3))) (bindint&log stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt)))))))
-;          (plot2d->file (histogram data #:bar-color "blue" #:line-color "gray" #:line-width 1/6)
-;                "histogram.png" 'png
-;                #:width 1000
-;                #:height 700
-;                #:title (string-upcase col)
-;                #:x-label "Hour"
-;                #:y-label (string-downcase col)))))))
-          data)))))
+               (cond ((< (string->number tableno) 10)
+                      (case (string->number agg-mode)
+                        ((1) (build-result (and (prepare stmt (construct-query (agg-by-hour-query base-stat-query) table col)) (bindint stmt ":first_snap" first-snap) (bindint stmt ":last_snap" last-endofweek-snap) (execute stmt) (getresultset stmt))))
+                        ((2) (build-result (and (prepare stmt (construct-query (detail-query base-stat-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 7))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))
+                        ((3) (build-result (and (prepare stmt (construct-query (detail-query base-stat-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 3))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))))
+                     ((< (string->number tableno) 20)
+                      (case (string->number agg-mode)
+                        ((1) (build-result (and (prepare stmt (construct-query (metric-agg-by-hour-query base-metric-query) table col)) (bindint stmt ":first_snap" first-snap) (bindint stmt ":last_snap" last-endofweek-snap) (execute stmt) (getresultset stmt))))
+                        ((2) (build-result (and (prepare stmt (construct-query (metric-detail-query base-metric-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 7))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))
+                        ((3) (build-result (and (prepare stmt (construct-query (metric-detail-query base-metric-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 3))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt)))))))))
+          (plot2d->file (histogram data #:color "blue" #:line-color "gray" #:line-width 1/6)
+                        "histogram.png"
+                        #:width 1200
+                        #:height 700
+                        #:title (string-upcase col)
+                        #:x-label "Hour"
+                        #:y-label (string-downcase col))
+          )))))
+          ;data)))))
 
-(parameterize ((logfile "/tmp/plot-awr.log")) (main))
+(parameterize ((logfile (build-path (current-directory) "plot-awr.log"))
+               (log-level (bitwise-ior 1 2 4)))
+  (main))
