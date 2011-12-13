@@ -1,8 +1,12 @@
 #lang racket
 
+(require plot)
 (require "../perftools/filters.rkt")
-(require "../plt-stuff/plot/plot2d.rkt")
 (require "../oci4racket/main.rkt")
+(plot-tick-size 5)
+
+(plot-new-window? #t)
+(plot-font-size 16)
 
 (define stat-tables
   '(("Historical statistics" (1 "dba_hist_sysstat") (2 "dba_hist_osstat") (3 "dba_hist_sys_time_model"))
@@ -96,7 +100,8 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
   '((1 "averaged by weekday and hour") (2 "by-hour data for last week") (3 "by-hour data for last 3 days")))
 
 (define (get-value-opts tableno table stmt)
-  (let ((cols-query (cond ((< tableno 10) (string-append "select distinct stat_name from " table " order by stat_name"))
+  (let ((cols-query (cond ((= tableno 2) (string-append "select distinct stat_name from " table " where stat_id in (select osstat_id from v$osstat where cumulative='YES') order by stat_name"))
+                          ((< tableno 10) (string-append "select distinct stat_name from " table " order by stat_name"))
                           ((< tableno 20) (string-append "select distinct metric_name from " table " order by metric_name")))))
     (let* ((res (begin (executestmt stmt cols-query) (getresultset stmt)))
            (namelst
@@ -129,42 +134,28 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
 
 (define (construct-query query table col)
   (regexp-replace "&&tablename" (regexp-replace "&&statname" query col) table))
-  
-(define (build-result resultset)
-  (let loop ((days '()) (hours '()) (vals '()))
-    (if (eq? #f (fetchnext resultset))
-        (foldr (lambda (x y result) (cons (vector x y) result)) '()
-               (foldl (lambda (day hour result)
-                        (cons (string-append (case hour ((0) (string-append day " ")) (else ""))
-                                             (case hour ((0 6 12 18) (format "~a:00" hour)) (else "")))
-                              result))
-                      '() days hours) (reverse vals))
-        (loop (cons (getstring2 resultset "day") days) (cons (getint2 resultset "time") hours) (cons (getdouble2 resultset "val") vals)))))
 
 (define (build-plot-data resultset)
   (let* ((data (get-data resultset))
-         (formatted-axis (format-x-axis (car data) (cadr data)))
-         (raw-values (caddr data))
-         (smoothed-byfives (byfives (raw-values))))
-    (list (vectorize-for-plotting formatted-axis raw-values)
-          (vectorize-for-plotting formatted-axis smoothed-byfives))))
+         (xs (x-axis-values (car data) (cadr data)))
+         (raw-values (caddr data)))
+    (vectorize-for-plotting xs raw-values)))
 
 (define (get-data resultset)
   (let loop ((days '()) (hours '()) (vals '()))
     (if (eq? #f (fetchnext resultset))
-        (list days hours vals)
+        (list (reverse days) (reverse hours) (reverse vals))
         (loop (cons (getstring2 resultset "day") days) (cons (getint2 resultset "time") hours) (cons (getdouble2 resultset "val") vals)))))
 
 (define (vectorize-for-plotting x-axis vals)
   (foldr (lambda (x y result) (cons (vector x y) result)) '() x-axis vals))
 
-(define (format-x-axis days hours)
-  (foldl (lambda (day hour result)
-           (cons (string-append (case hour ((0) (string-append day " ")) (else ""))
-                                (case hour ((0 6 12 18) (format "~a:00" hour)) (else "")))
+(define (x-axis-values days hours)
+  (foldr (lambda (day hour result)
+           (cons (string-append (case hour ((0) (string-append day "")) (else ""))
+                                (case hour ((4 8 12 16 20) (format "~a" hour)) (else "")))
                  result))
          '() days hours))
-                               
   
 (define (main)
   (let* ((conn (begin (init) (connect "orcl" "hr" "hr" 'oci_session_default)))
@@ -185,23 +176,24 @@ and to_char(end_interval_time, 'hh24') = '00' -- first compared-to (= subtracted
         (let ((data
                (cond ((< (string->number tableno) 10)
                       (case (string->number agg-mode)
-                        ((1) (build-result (and (prepare stmt (construct-query (agg-by-hour-query base-stat-query) table col)) (bindint stmt ":first_snap" first-snap) (bindint stmt ":last_snap" last-endofweek-snap) (execute stmt) (getresultset stmt))))
-                        ((2) (build-result (and (prepare stmt (construct-query (detail-query base-stat-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 7))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))
-                        ((3) (build-result (and (prepare stmt (construct-query (detail-query base-stat-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 3))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))))
+                        ((1) (build-plot-data (and (prepare stmt (construct-query (agg-by-hour-query base-stat-query) table col)) (bindint stmt ":first_snap" first-snap) (bindint stmt ":last_snap" last-endofweek-snap) (execute stmt) (getresultset stmt))))
+                        ((2) (build-plot-data (and (prepare stmt (construct-query (detail-query base-stat-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 7))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))
+                        ((3) (build-plot-data (and (prepare stmt (construct-query (detail-query base-stat-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 3))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))))
                      ((< (string->number tableno) 20)
                       (case (string->number agg-mode)
-                        ((1) (build-result (and (prepare stmt (construct-query (metric-agg-by-hour-query base-metric-query) table col)) (bindint stmt ":first_snap" first-snap) (bindint stmt ":last_snap" last-endofweek-snap) (execute stmt) (getresultset stmt))))
-                        ((2) (build-result (and (prepare stmt (construct-query (metric-detail-query base-metric-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 7))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))
-                        ((3) (build-result (and (prepare stmt (construct-query (metric-detail-query base-metric-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 3))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt)))))))))
-          (plot2d->file (histogram data #:color "blue" #:line-color "gray" #:line-width 1/6)
-                        "histogram.png"
-                        #:width 1200
-                        #:height 700
-                        #:title (string-upcase col)
-                        #:x-label "Hour"
-                        #:y-label (string-downcase col))
-          )))))
-          ;data)))))
+                        ((1) (build-plot-data (and (prepare stmt (construct-query (metric-agg-by-hour-query base-metric-query) table col)) (bindint stmt ":first_snap" first-snap) (bindint stmt ":last_snap" last-endofweek-snap) (execute stmt) (getresultset stmt))))
+                        ((2) (build-plot-data (and (prepare stmt (construct-query (metric-detail-query base-metric-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 7))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt))))
+                        ((3) (build-plot-data (and (prepare stmt (construct-query (metric-detail-query base-metric-query) table col)) (bindint stmt ":first_snap" (- last-snap (* 24 3))) (bindint stmt ":last_snap" last-snap) (execute stmt) (getresultset stmt)))))))))
+          (begin (and (connfree conn) clean)
+                 (plot-file (discrete-histogram data #:label (string-downcase col))
+                               (string-append (string-downcase col) ".png")
+                               #:width 1400
+                               #:height 800
+                               #:title (string-downcase col)
+                               #:x-label "Hour"
+                               #:y-label (string-downcase col))
+                 ;data
+                 ))))))
 
 (parameterize ((logfile (build-path (current-directory) "plot-awr.log"))
                (log-level (bitwise-ior 1 2 4)))
